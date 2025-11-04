@@ -1,4 +1,7 @@
+// index.js
 import 'dotenv/config';
+import fs from 'fs';
+import path from 'path';
 import express from 'express';
 import bodyParser from 'body-parser';
 import { google } from 'googleapis';
@@ -6,60 +9,123 @@ import { google } from 'googleapis';
 const app = express();
 app.use(bodyParser.json({ limit: '2mb' }));
 
-// ---- Google Sheets Auth (supports FILE locally or JSON in env for Render) ----
-const SHEET_ID = process.env.SPREADSHEET_ID;               // keep your current name
-const KEY_FILE = process.env.GCP_SERVICE_ACCOUNT_FILE;     // local (optional)
-const KEY_JSON = process.env.GCP_SERVICE_ACCOUNT_JSON;     // Render (preferred)
+// ---------------------- ENV ----------------------
+const SHEET_ID = process.env.SPREADSHEET_ID;                // required
+const KEY_FILE = process.env.GCP_SERVICE_ACCOUNT_FILE;      // optional (local)
+const KEY_JSON_ENV = process.env.GCP_SERVICE_ACCOUNT_JSON;  // preferred (Render)
+
+// ----------------- GOOGLE AUTH HELPER -----------------
+function loadServiceAccountCreds() {
+  // 1) If env contains a JSON blob
+  if (KEY_JSON_ENV && KEY_JSON_ENV.trim().startsWith('{')) {
+    return JSON.parse(KEY_JSON_ENV);
+  }
+  // 2) If env contains a file path (e.g., /etc/secrets/service-account.json)
+  if (KEY_JSON_ENV && KEY_JSON_ENV.startsWith('/')) {
+    const p = KEY_JSON_ENV;
+    return JSON.parse(fs.readFileSync(p, 'utf8'));
+  }
+  // 3) If GCP_SERVICE_ACCOUNT_FILE is provided (local dev)
+  if (KEY_FILE) {
+    const p = path.resolve(KEY_FILE);
+    return JSON.parse(fs.readFileSync(p, 'utf8'));
+  }
+  throw new Error(
+    'Set GCP_SERVICE_ACCOUNT_JSON (JSON or absolute file path) OR GCP_SERVICE_ACCOUNT_FILE (path).'
+  );
+}
 
 if (!SHEET_ID) {
-  console.error('Missing SPREADSHEET_ID in .env');
+  console.error('Missing SPREADSHEET_ID');
   process.exit(1);
 }
 
 let auth;
 try {
-  if (KEY_JSON && KEY_JSON.trim().startsWith('{')) {
-    auth = new google.auth.GoogleAuth({
-      credentials: JSON.parse(KEY_JSON),
-      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-    });
-  } else if (KEY_FILE) {
-    auth = new google.auth.GoogleAuth({
-      keyFile: KEY_FILE,
-      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-    });
-  } else {
-    throw new Error('Set GCP_SERVICE_ACCOUNT_JSON (Render) or GCP_SERVICE_ACCOUNT_FILE (local).');
-  }
+  const credentials = loadServiceAccountCreds();
+  auth = new google.auth.GoogleAuth({
+    credentials,
+    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+  });
 } catch (e) {
   console.error('Failed to load Google credentials:', e);
   process.exit(1);
 }
 
 const sheets = google.sheets({ version: 'v4', auth });
-// ------------------------------------------------------------------------------
 
+// ----------------- NORMALIZERS -----------------
+function safeStr(x) {
+  if (x === null || x === undefined) return '';
+  if (typeof x === 'string') return x.trim();
+  return String(x);
+}
+
+function buildSummary({ role, inquiry, market, deal_size, urgency }) {
+  const r = role ? role.toLowerCase() : 'caller';
+  const parts = [];
+  parts.push(`${r.charAt(0).toUpperCase() + r.slice(1)} interested in ${inquiry || 'a property transaction'}`);
+  if (market) parts.push(`in ${market}`);
+  if (deal_size) parts.push(`(budget/deal ${deal_size})`);
+  if (urgency) parts.push(`timeline ${urgency}`);
+  return parts.join(' ') + '.';
+}
+
+function trimRaw(p) {
+  // Keep only compact essentials so the cell stays small
+  const caller = p?.caller || {};
+  const quals = p?.qualifications || {};
+  const meta  = p?.assistant?.metadata || {};
+  return {
+    brokerage: meta?.brokerageName || '',
+    caller: {
+      name: caller?.name || '',
+      phone: caller?.phone || '',
+      email: caller?.email || '',
+    },
+    qualifications: {
+      role: quals?.role || '',
+      inquiry: quals?.inquiry || '',
+      market: quals?.market || '',
+      deal_size: quals?.deal_size || '',
+      urgency: quals?.urgency || '',
+    },
+    summary: p?.summary || p?.final_summary || '',
+    at: p?.timestamp || Date.now(),
+  };
+}
+
+// ----------------- ROUTES -----------------
 app.post('/vapi/webhook', async (req, res) => {
   try {
-    const p = req.body || {};
-    const meta = p?.assistant?.metadata || {};
-    const caller = p?.caller || {};
-    const quals  = p?.qualifications || {};
-    const summary = p?.summary || p?.final_summary || '';
+    const body = req.body || {};
+
+    const meta   = body?.assistant?.metadata || {};
+    const caller = body?.caller || {};
+    const quals  = body?.qualifications || {};
+    const summaryText = safeStr(body?.summary || body?.final_summary || '');
+
+    const timestamp = new Date().toISOString().replace('T', ' ').replace('Z', ' UTC');
 
     const row = [
-      new Date().toISOString().replace('T',' ').replace('Z',' UTC'), // UTC timestamp
-      meta.brokerageName || '',
-      caller.name || '',
-      caller.phone || '',
-      caller.email || '',
-      quals.role || '',
-      quals.inquiry || '',
-      quals.market || '',
-      quals.deal_size || '',
-      quals.urgency || '',
-      summary || '',
-      JSON.stringify(p).slice(0, 50000)
+      timestamp,                               // Timestamp
+      safeStr(meta.brokerageName || ''),       // Brokerage
+      safeStr(caller.name || ''),              // Name
+      safeStr(caller.phone || ''),             // Phone
+      safeStr(caller.email || ''),             // Email
+      safeStr(quals.role || ''),               // Role
+      safeStr(quals.inquiry || ''),            // Inquiry
+      safeStr(quals.market || ''),             // Market
+      safeStr(quals.deal_size || ''),          // Deal Size
+      safeStr(quals.urgency || ''),            // Urgency
+      safeStr(summaryText || buildSummary({
+        role: quals.role,
+        inquiry: quals.inquiry,
+        market: quals.market,
+        deal_size: quals.deal_size,
+        urgency: quals.urgency
+      })),                                     // Summary
+      JSON.stringify(trimRaw(body))            // Raw (trimmed)
     ];
 
     await sheets.spreadsheets.values.append({
@@ -69,10 +135,10 @@ app.post('/vapi/webhook', async (req, res) => {
       requestBody: { values: [row] }
     });
 
-    res.json({ ok: true });
+    return res.json({ ok: true });
   } catch (err) {
     console.error('Webhook error:', err);
-    res.json({ ok: false, error: String(err) });
+    return res.json({ ok: false, error: String(err) });
   }
 });
 
