@@ -4,19 +4,19 @@ import bodyParser from 'body-parser';
 import { google } from 'googleapis';
 
 const app = express();
-app.use(bodyParser.json({ limit: '2mb' }));
 
-// ====== ENV ======
-const SHEET_ID  = process.env.SPREADSHEET_ID;                   // REQUIRED
-const KEY_JSON  = process.env.GCP_SERVICE_ACCOUNT_JSON || '';   // Option A (paste full JSON)
-const KEY_FILE  = process.env.GCP_SERVICE_ACCOUNT_FILE  || '';  // Option B (/etc/secrets/service-account.json)
+// Accept JSON, urlencoded, and plain text (some providers send text/json)
+app.use(bodyParser.json({ limit: '2mb', type: ['application/json', 'text/json', 'application/*+json'] }));
+app.use(bodyParser.urlencoded({ extended: true }));
 
-if (!SHEET_ID) {
-  console.error('❌ Missing SPREADSHEET_ID');
-  process.exit(1);
-}
+// ===== Env =====
+const SHEET_ID = process.env.SPREADSHEET_ID;
+const KEY_JSON = process.env.GCP_SERVICE_ACCOUNT_JSON || '';
+const KEY_FILE = process.env.GCP_SERVICE_ACCOUNT_FILE  || '';
 
-// ====== GOOGLE AUTH (supports JSON or FILE) ======
+if (!SHEET_ID) { console.error('❌ Missing SPREADSHEET_ID'); process.exit(1); }
+
+// ===== Google Auth (JSON or file) =====
 let auth;
 try {
   if (KEY_JSON.trim().startsWith('{')) {
@@ -30,71 +30,125 @@ try {
       scopes: ['https://www.googleapis.com/auth/spreadsheets'],
     });
   } else {
-    throw new Error('Set GCP_SERVICE_ACCOUNT_JSON (full JSON) OR GCP_SERVICE_ACCOUNT_FILE (/etc/secrets/service-account.json)');
+    throw new Error('Set GCP_SERVICE_ACCOUNT_JSON or GCP_SERVICE_ACCOUNT_FILE');
   }
-} catch (e) {
-  console.error('❌ Google auth error:', e);
-  process.exit(1);
-}
+} catch (e) { console.error('❌ Google auth error', e); process.exit(1); }
 
 const sheets = google.sheets({ version: 'v4', auth });
 
-// ====== HELPERS ======
+// ===== Helpers =====
 const safe = (v) => (v ?? '').toString().trim();
-const oneLine = (v) => safe(v).replace(/\s+/g, ' ').slice(0, 800);   // short Raw
-const nowUTC = () => new Date().toISOString().replace('T',' ').replace('Z',' UTC');
+const oneLine = (v) => safe(v).replace(/\s+/g, ' ').slice(0, 400);
+const nowUTC = () => new Date().toISOString().replace('T', ' ').replace('Z', ' UTC');
 
-// fallback regex from transcript if Vapi didn’t parse some fields
-const extractFromText = (txt='') => {
-  const email = (txt.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i) || [])[0];
-  const phone = (txt.match(/(\+?\d[\d\s\-().]{8,}\d)/) || [])[0];
-  const name  = (txt.match(/(?:my name is|this is)\s+([A-Za-z][A-Za-z .'-]{1,40})/i) || [])[1];
+// robust getter: finds first non-empty among many paths
+const pickPath = (obj, paths) => {
+  for (const p of paths) {
+    try {
+      const val = p.split('.').reduce((a, k) => (a ? a[k] : undefined), obj);
+      if (val !== undefined && safe(val) !== '') return val;
+    } catch (_) {}
+  }
+  return '';
+};
+
+// fallback extractors from free text
+const extractFromText = (txt = '') => {
+  const email = (txt.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i) || [])[0] || '';
+  const phone = (txt.match(/(\+?\d[\d\s\-().]{8,}\d)/) || [])[0] || '';
+  const name  = (txt.match(/(?:my name is|this is)\s+([A-Za-z][A-Za-z .'-]{1,40})/i) || [])[1] || '';
   return { name, phone, email };
 };
 
-const pick = (...vals) => safe(vals.find(v => v && safe(v).length > 0));
-
-// ====== WEBHOOK ======
+// ===== Webhook =====
 app.post('/vapi/webhook', async (req, res) => {
   try {
-    const body = req.body || {};
+    // Some hosts send the whole payload as a string — parse if so
+    const payload = (typeof req.body === 'string')
+      ? JSON.parse(req.body)
+      : (req.body || {});
 
-    // Vapi fields (covering multiple versions/keys)
-    const a   = body.assistant || {};
-    const meta= a.metadata || {};
-    const caller = body.caller || {};
-    const q   = body.qualifications || {};
-    const s   = body.structuredData || {};
-    const analysis = body.analysis || {};
+    // Try all the likely places Vapi/OpenAI-style payloads use
+    const summary = pickPath(payload, [
+      'summary', 'final_summary',
+      'analysis.summary', 'analysis.callSummary',
+      'result.summary', 'result.final_summary',
+      'assistant.summary',
+      'structuredOutput.summary', 'structured_output.summary', 'structuredData.summary'
+    ]);
 
-    const summary =
-      pick(body.summary, body.final_summary, analysis.summary, analysis.callSummary);
+    const transcript = pickPath(payload, [
+      'analysis.transcript', 'transcript', 'result.transcript'
+    ]);
 
-    const transcript = safe(analysis.transcript);
-    const fb = extractFromText(`${summary} ${transcript}`);
+    const textAll = `${summary} ${transcript} ${JSON.stringify(payload)}`;
+    const fb = extractFromText(textAll);
+
+    const brokerage = pickPath(payload, [
+      'assistant.metadata.brokerageName',
+      'metadata.brokerageName',
+      'brokerageName'
+    ]) || 'Ariel Property Advisors';
+
+    const name  = pickPath(payload, [
+      'caller.name', 'qualifications.name',
+      'structuredData.name', 'structured_output.name',
+      'structuredOutput.name', 'result.name'
+    ]) || fb.name;
+
+    const phone = pickPath(payload, [
+      'caller.phone', 'qualifications.phone',
+      'structuredData.phone', 'structured_output.phone',
+      'structuredOutput.phone', 'result.phone'
+    ]) || fb.phone;
+
+    const email = pickPath(payload, [
+      'caller.email', 'qualifications.email',
+      'structuredData.email', 'structured_output.email',
+      'structuredOutput.email', 'result.email'
+    ]) || fb.email;
+
+    const role = pickPath(payload, [
+      'qualifications.role', 'structuredData.role',
+      'structuredOutput.role', 'structured_output.role'
+    ]);
+
+    const inquiry = pickPath(payload, [
+      'qualifications.inquiry', 'structuredData.inquiry',
+      'structuredOutput.inquiry', 'structured_output.inquiry'
+    ]);
+
+    const market = pickPath(payload, [
+      'qualifications.market', 'structuredData.market',
+      'structuredOutput.market', 'structured_output.market'
+    ]);
+
+    const dealSize = pickPath(payload, [
+      'qualifications.deal_size', 'qualifications.dealSize',
+      'structuredData.deal_size', 'structuredData.dealSize',
+      'structuredOutput.deal_size', 'structured_output.deal_size'
+    ]);
+
+    const urgency = pickPath(payload, [
+      'qualifications.urgency', 'structuredData.urgency',
+      'structuredOutput.urgency', 'structured_output.urgency',
+      'timeline'
+    ]);
 
     const row = [
-      nowUTC(),                                                       // A Timestamp
-      pick(meta.brokerageName, 'Ariel Property Advisors'),            // B Brokerage
-      pick(caller.name, q.name, s.name, fb.name),                     // C Name
-      pick(caller.phone, q.phone, s.phone, fb.phone),                 // D Phone
-      pick(caller.email, q.email, s.email, fb.email),                 // E Email
-      pick(q.role, s.role),                                           // F Role
-      pick(q.inquiry, s.inquiry),                                     // G Inquiry
-      pick(q.market, s.market),                                       // H Market
-      pick(q.deal_size, s.deal_size),                                 // I Deal Size
-      pick(q.urgency, s.urgency),                                     // J Urgency
-      oneLine(summary),                                               // K Summary
-      oneLine(JSON.stringify({                                        // L Raw (short)
-        name: pick(caller.name, q.name, s.name, fb.name),
-        phone: pick(caller.phone, q.phone, s.phone, fb.phone),
-        email: pick(caller.email, q.email, s.email, fb.email),
-        role: pick(q.role, s.role),
-        inquiry: pick(q.inquiry, s.inquiry),
-        market: pick(q.market, s.market),
-        deal_size: pick(q.deal_size, s.deal_size),
-        urgency: pick(q.urgency, s.urgency),
-        summary: oneLine(summary)
+      nowUTC(),                        // A Timestamp
+      safe(brokerage),                 // B Brokerage
+      safe(name),                      // C Name
+      safe(phone),                     // D Phone
+      safe(email),                     // E Email
+      safe(role),                      // F Role
+      safe(inquiry),                   // G Inquiry
+      safe(market),                    // H Market
+      safe(dealSize),                  // I Deal Size
+      safe(urgency),                   // J Urgency
+      oneLine(summary),                // K Summary (short)
+      oneLine(JSON.stringify({         // L Raw (short & structured)
+        name, phone, email, role, inquiry, market, dealSize, urgency
       }))
     ];
 
@@ -105,11 +159,11 @@ app.post('/vapi/webhook', async (req, res) => {
       requestBody: { values: [row] }
     });
 
-    console.log('✅ Appended row to Google Sheet');
+    console.log('✅ Row appended:', row);
     res.json({ ok: true });
   } catch (err) {
-    console.error('❌ Webhook error:', err);
-    res.json({ ok: false, error: String(err) });
+    console.error('❌ Webhook error', err);
+    res.status(200).json({ ok: false, error: String(err) });
   }
 });
 
@@ -117,4 +171,4 @@ app.get('/', (_req, res) => res.send('Webhook running ✅'));
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('🚀 Server listening on port', PORT));
+app.listen(PORT, () => console.log('🚀 Server listening on', PORT));
