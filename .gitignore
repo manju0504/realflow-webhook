@@ -1,0 +1,6 @@
+# Do not upload these folders/files
+node_modules/
+.env
+keys/
+*.log
+.DS_Store
