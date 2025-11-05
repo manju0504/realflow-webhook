@@ -11,5 +11,8 @@
     "body-parser": "^1.20.3",
     "express": "^4.19.2",
     "googleapis": "^131.0.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
