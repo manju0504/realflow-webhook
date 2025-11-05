@@ -1,165 +1,152 @@
-// ---------- Imports & App ----------
-const express = require('express');
-const bodyParser = require('body-parser');
-const { google } = require('googleapis');
+// index.js
+import 'dotenv/config';
+import express from 'express';
+import { google } from 'googleapis';
 
 const app = express();
-app.use(bodyParser.json({ limit: '2mb' }));
 
-// ---------- Env ----------
-const PORT = process.env.PORT || 3000;
-const SHEET_ID = process.env.SHEET_ID; // required
+// ✅ Accept ANY content-type as JSON and allow larger payloads (Vapi sends big data)
+app.use(express.json({ limit: '10mb', type: () => true }));
+
+// ---------------- Google Sheets Auth ----------------
+const SHEET_ID = process.env.SPREADSHEET_ID;
+const KEY_FILE = process.env.GCP_SERVICE_ACCOUNT_FILE;
+const KEY_JSON = process.env.GCP_SERVICE_ACCOUNT_JSON;
+
 if (!SHEET_ID) {
-  console.error('❌ Missing SHEET_ID env');
+  console.error('❌ Missing SPREADSHEET_ID');
   process.exit(1);
 }
 
-// Auth: either GOOGLE_APPLICATION_CREDENTIALS (file path) OR GOOGLE_CREDENTIALS (inline JSON)
 let auth;
 try {
-  if (process.env.GOOGLE_CREDENTIALS) {
-    const creds = JSON.parse(process.env.GOOGLE_CREDENTIALS);
+  if (KEY_JSON && KEY_JSON.trim().startsWith('{')) {
     auth = new google.auth.GoogleAuth({
-      credentials: creds,
+      credentials: JSON.parse(KEY_JSON),
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+  } else if (KEY_FILE) {
+    auth = new google.auth.GoogleAuth({
+      keyFile: KEY_FILE,
       scopes: ['https://www.googleapis.com/auth/spreadsheets'],
     });
   } else {
-    auth = new google.auth.GoogleAuth({
-      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-    });
+    throw new Error('Set GCP_SERVICE_ACCOUNT_JSON (Render) or GCP_SERVICE_ACCOUNT_FILE (local).');
   }
 } catch (e) {
-  console.error('❌ Google auth init failed:', e);
+  console.error('❌ Failed to load Google credentials:', e);
   process.exit(1);
 }
 
 const sheets = google.sheets({ version: 'v4', auth });
-
-// De-dupe memory (per-process). Good enough for Render.
-const seenCallIds = new Set();
+// ----------------------------------------------------
 
 // ---------- Helpers ----------
-const clean = (v) => (v == null ? '' : String(v).trim());
+const pick = (obj, key, fallback = '') =>
+  (obj && typeof obj === 'object' && obj[key] != null ? String(obj[key]) : fallback);
 
-const smallRaw = (lead) => {
-  try {
-    const j = JSON.stringify(lead || {});
-    return j.length > 500 ? j.slice(0, 497) + '...' : j;
-  } catch {
-    return '';
+function extractLead(payload = {}) {
+  const so =
+    payload.structured_outputs ||
+    payload.structuredOutputs ||
+    payload.outputs ||
+    payload.output ||
+    null;
+
+  let leadFromSO = null;
+
+  if (so && typeof so === 'object' && !Array.isArray(so) && so.lead) {
+    leadFromSO = so.lead;
   }
-};
-
-// Pull a likely call/session identifier so we only write once per call
-const getCallId = (p) =>
-  clean(
-    p.call_id ||
-    p.callId ||
-    p.session_id ||
-    p.sessionId ||
-    (p.metadata && (p.metadata.call_id || p.metadata.session_id)) ||
-    ''
-  );
-
-// Find any “lead” structured output regardless of where Vapi put it
-const extractLead = (p) => {
-  // 1) Direct `lead` object (some screens send it this way)
-  if (p && typeof p.lead === 'object' && p.lead) {
-    return normalizeLead(p.lead, p.summary);
-  }
-
-  // 2) Top-level structured outputs
-  const tryCollections = [];
-  if (Array.isArray(p?.structured_outputs)) tryCollections.push(p.structured_outputs);
-  if (Array.isArray(p?.assistant?.structured_outputs)) tryCollections.push(p.assistant.structured_outputs);
-  if (Array.isArray(p?.data?.structured_outputs)) tryCollections.push(p.data.structured_outputs);
-
-  for (const arr of tryCollections) {
-    const hit =
-      arr.find((x) => (x?.name || '').toLowerCase() === 'lead') ||
-      arr.find((x) => x?.type === 'lead' || x?.id === 'lead') ||
-      arr.find((x) => x && typeof x === 'object' && (
-        x.lead || x.data?.lead || x.data
-      ));
-
-    if (hit) {
-      // Common shapes:
-      // { name:'lead', data:{...} }
-      // { lead:{...} }
-      // {...fields...}
-      const payload = hit.lead || hit.data?.lead || hit.data || hit;
-      return normalizeLead(payload, p.summary);
+  if (!leadFromSO && Array.isArray(so)) {
+    for (const item of so) {
+      if (item && item.name === 'lead' && item.data) { leadFromSO = item.data; break; }
+      if (item && item.lead) { leadFromSO = item.lead; break; }
     }
   }
 
-  // Nothing found → return empty
-  return normalizeLead({}, p.summary);
-};
+  const caller = payload.caller || {};
+  const quals = payload.qualifications || {};
+  const summary = payload.summary || payload.final_summary || payload.analysis?.summary || '';
 
-const normalizeLead = (raw, summary) => {
-  // Map & trim everything we care about
-  const out = {
-    name: clean(raw.name),
-    phone: clean(raw.phone),
-    email: clean(raw.email),
-    role: clean(raw.role),
-    inquiry: clean(raw.inquiry),
-    market: clean(raw.market),
-    dealSize: clean(raw.dealSize || raw.deal_size || raw.budget),
-    urgency: clean(raw.urgency || raw.timeline),
-    summary: clean(summary || raw.summary),
+  const mapped = {
+    name: '', phone: '', email: '', role: '',
+    inquiry: '', market: '', dealSize: '', urgency: '', summary
   };
-  return out;
-};
 
-const hasAnyLeadField = (lead) =>
-  Object.entries(lead).some(([k, v]) => k !== 'summary' && clean(v) !== '');
+  if (leadFromSO) {
+    mapped.name    = pick(leadFromSO, 'name');
+    mapped.phone   = pick(leadFromSO, 'phone');
+    mapped.email   = pick(leadFromSO, 'email');
+    mapped.role    = pick(leadFromSO, 'role');
+    mapped.inquiry = pick(leadFromSO, 'inquiry');
+    mapped.market  = pick(leadFromSO, 'market');
+    mapped.dealSize= pick(leadFromSO, 'dealSize') || pick(leadFromSO, 'deal_size');
+    mapped.urgency = pick(leadFromSO, 'urgency');
+  } else {
+    mapped.name    = pick(caller, 'name');
+    mapped.phone   = pick(caller, 'phone');
+    mapped.email   = pick(caller, 'email');
+    mapped.role    = pick(quals,  'role');
+    mapped.inquiry = pick(quals,  'inquiry');
+    mapped.market  = pick(quals,  'market');
+    mapped.dealSize= pick(quals,  'deal_size') || pick(quals, 'dealSize');
+    mapped.urgency = pick(quals,  'urgency');
+  }
 
-// ---------- Routes ----------
-app.get('/', (req, res) => {
-  res.send('OK');
-});
+  return mapped;
+}
 
+function smallRaw(obj) {
+  try {
+    const keep = { lead: {
+      name: obj.name || '', phone: obj.phone || '', email: obj.email || '',
+      role: obj.role || '', inquiry: obj.inquiry || '', market: obj.market || '',
+      dealSize: obj.dealSize || '', urgency: obj.urgency || ''
+    }};
+    return JSON.stringify(keep);
+  } catch { return '{}'; }
+}
+// ----------------------------------------------------
+
+// ---------- Main Webhook ----------
 app.post('/vapi/webhook', async (req, res) => {
   try {
-    const p = req.body || {};
+    // 🧠 Debug logs — don’t remove yet!
+    console.log(
+      'INCOMING PAYLOAD content-type=%s length=%s',
+      req.headers['content-type'],
+      req.headers['content-length']
+    );
+    const preview = (() => {
+      try {
+        const src = req.body?.structured_outputs ?? req.body?.structuredOutputs ?? req.body;
+        return JSON.stringify(src, null, 2).slice(0, 2000);
+      } catch { return '<unserializable>'; }
+    })();
+    console.log('INCOMING BODY (trimmed):', preview);
 
-    // Pull brokerage label (you set this in Assistant metadata)
+    const p = req.body || {};
     const brokerage =
-      clean(p?.assistant?.metadata?.brokerageName) ||
-      clean(p?.assistant?.brokerageName) ||
+      p?.assistant?.metadata?.brokerageName ||
+      p?.assistant?.brokerageName ||
       'Ariel Property Advisors';
 
-    const callId = getCallId(p);
     const lead = extractLead(p);
 
-    // Only write when a real structured output is present
-    if (!hasAnyLeadField(lead)) {
-      return res.status(200).json({ ok: true, skipped: 'no structured output yet' });
-    }
-
-    // De-dupe: write once per call/session
-    if (callId) {
-      if (seenCallIds.has(callId)) {
-        return res.status(200).json({ ok: true, skipped: 'already wrote for this call' });
-      }
-      seenCallIds.add(callId);
-    }
-
-    // Row A–L
     const row = [
-      new Date().toISOString().replace('T', ' ').replace('Z', ' UTC'), // A Timestamp
-      brokerage,                         // B Brokerage
-      lead.name,                         // C
-      lead.phone,                        // D
-      lead.email,                        // E
-      lead.role,                         // F
-      lead.inquiry,                      // G
-      lead.market,                       // H
-      lead.dealSize,                     // I
-      lead.urgency,                      // J
-      lead.summary || '',                // K Summary
-      smallRaw(lead),                    // L Raw (tiny JSON)
+      new Date().toISOString().replace('T', ' ').replace('Z', ' UTC'),
+      brokerage,
+      lead.name,
+      lead.phone,
+      lead.email,
+      lead.role,
+      lead.inquiry,
+      lead.market,
+      lead.dealSize,
+      lead.urgency,
+      lead.summary || '',
+      smallRaw(lead),
     ];
 
     await sheets.spreadsheets.values.append({
@@ -169,15 +156,18 @@ app.post('/vapi/webhook', async (req, res) => {
       requestBody: { values: [row] },
     });
 
-    return res.status(200).json({ ok: true, wrote: true, callId });
+    return res.json({ ok: true });
   } catch (err) {
     console.error('❌ Webhook error:', err);
-    // Always 200 so Vapi doesn’t retry, but include the error for visibility
     return res.status(200).json({ ok: false, error: String(err) });
   }
 });
+// ----------------------------------------------------
 
-// ---------- Start ----------
-app.listen(PORT, () => {
-  console.log(`✅ Server listening on ${PORT}`);
-});
+// ---------- Health Routes ----------
+app.get('/', (_req, res) => res.send('Webhook running'));
+app.get('/healthz', (_req, res) => res.json({ ok: true }));
+
+// ---------- Server ----------
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log('✅ Server listening on', PORT));
