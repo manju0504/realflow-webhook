@@ -6,18 +6,16 @@ const { google } = require('googleapis');
 const app = express();
 app.use(bodyParser.json({ limit: '2mb' }));
 
-// ---------- Env ----------
-// accept either SHEET_ID or SPREADSHEET_ID
+// ---------- ENV ----------
 const SHEET_ID = process.env.SHEET_ID || process.env.SPREADSHEET_ID;
 if (!SHEET_ID) {
   console.error('❌ Missing SHEET_ID / SPREADSHEET_ID env var');
   process.exit(1);
 }
 
-// Auth options (any one):
-// 1) GOOGLE_CREDENTIALS = full JSON (one-line)
-// 2) GOOGLE_APPLICATION_CREDENTIALS = /path/to/service-account.json
-// 3) Default ADC if running somewhere with creds
+// Google auth: choose one of these approaches via envs
+// 1) GOOGLE_CREDENTIALS: full JSON (minified one-line)
+// 2) GOOGLE_APPLICATION_CREDENTIALS: absolute path to service-account.json (e.g., /etc/secrets/service-account.json)
 let auth;
 try {
   if (process.env.GOOGLE_CREDENTIALS) {
@@ -26,14 +24,8 @@ try {
       credentials: creds,
       scopes: ['https://www.googleapis.com/auth/spreadsheets'],
     });
-  } else if (process.env.GCP_SERVICE_ACCOUNT_JSON) {
-    const creds = JSON.parse(process.env.GCP_SERVICE_ACCOUNT_JSON);
-    auth = new google.auth.GoogleAuth({
-      credentials: creds,
-      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-    });
   } else {
-    // If using a secret file on Render, set GOOGLE_APPLICATION_CREDENTIALS=/etc/secrets/service-account.json
+    // This uses GOOGLE_APPLICATION_CREDENTIALS if set, or falls back to default ADC.
     auth = new google.auth.GoogleAuth({
       scopes: ['https://www.googleapis.com/auth/spreadsheets'],
     });
@@ -45,7 +37,7 @@ try {
 
 const sheets = google.sheets({ version: 'v4', auth });
 
-// ---------- Helpers ----------
+// ---------- HELPERS ----------
 const clean = (v) => (v == null ? '' : String(v).trim());
 const smallRaw = (obj) => {
   try {
@@ -59,7 +51,7 @@ const getCallId = (p) =>
     p?.metadata?.call_id || p?.metadata?.session_id || ''
   );
 
-// Extract “lead” if present (Vapi structured output)
+// Try to pull a “lead” object from Vapi structured outputs
 const tryExtractLeadSO = (p) => {
   if (p && typeof p.lead === 'object' && p.lead) return p.lead;
 
@@ -82,7 +74,7 @@ const tryExtractLeadSO = (p) => {
   return null;
 };
 
-// Extract from caller/qualifications style
+// Extract from caller/qualifications style (your current screenshot)
 const tryExtractCQ = (p) => {
   const caller = p?.caller || {};
   const q = p?.qualifications || {};
@@ -114,8 +106,8 @@ const hasAnyLeadField = (lead) =>
   ['name','phone','email','role','inquiry','market','dealSize','urgency']
     .some((k) => clean(lead[k]) !== '');
 
-// ---------- Routes ----------
-app.get('/', (_req, res) => res.send('OK'));
+// ---------- ROUTES ----------
+app.get('/', (_req, res) => res.send('Realflow Vapi Webhook ✅'));
 
 const seenCallIds = new Set();
 
@@ -130,16 +122,17 @@ app.post('/vapi/webhook', async (req, res) => {
 
     const callId = getCallId(p);
 
-    // prefer structured output 'lead', else fall back to caller/qualifications
+    // Prefer structured output “lead”, else fall back to caller/qualifications
     const leadSO = tryExtractLeadSO(p);
     const cq = tryExtractCQ(p);
     const merged = normalize({ ...(leadSO || {}), ...cq }, p?.summary);
 
+    // If we don't have any meaningful fields yet, skip (Vapi may fire multiple events)
     if (!hasAnyLeadField(merged)) {
-      // store at least a lightweight raw for debugging once per call
       return res.status(200).json({ ok: true, skipped: 'no useful fields yet' });
     }
 
+    // Avoid double-writes per call
     if (callId) {
       if (seenCallIds.has(callId)) {
         return res.status(200).json({ ok: true, skipped: 'already wrote for this call' });
@@ -159,7 +152,7 @@ app.post('/vapi/webhook', async (req, res) => {
       merged.dealSize,
       merged.urgency,
       merged.summary,
-      smallRaw({ lead: merged }), // Raw
+      smallRaw({ lead: merged }), // Raw (compact)
     ];
 
     await sheets.spreadsheets.values.append({
@@ -172,10 +165,10 @@ app.post('/vapi/webhook', async (req, res) => {
     return res.status(200).json({ ok: true, wrote: true, callId });
   } catch (e) {
     console.error('❌ Webhook error:', e);
-    // keep 200 to avoid retries
+    // Return 200 so Vapi doesn’t retry aggressively
     return res.status(200).json({ ok: false, error: String(e) });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Server on :${PORT}`));
+app.listen(PORT, () => console.log(`✅ Server listening on :${PORT}`));
