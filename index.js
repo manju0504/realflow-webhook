@@ -1,11 +1,12 @@
 // index.js
 import 'dotenv/config';
 import express from 'express';
-import bodyParser from 'body-parser';
 import { google } from 'googleapis';
 
 const app = express();
-app.use(bodyParser.json({ limit: '2mb' }));
+
+// ✅ Accept ANY content-type as JSON and allow larger payloads (Vapi sends big data)
+app.use(express.json({ limit: '10mb', type: () => true }));
 
 // ---------------- Google Sheets Auth ----------------
 const SHEET_ID = process.env.SPREADSHEET_ID;
@@ -40,58 +41,37 @@ try {
 const sheets = google.sheets({ version: 'v4', auth });
 // ----------------------------------------------------
 
-// ---------- Helpers to normalize payload ------------
+// ---------- Helpers ----------
 const pick = (obj, key, fallback = '') =>
   (obj && typeof obj === 'object' && obj[key] != null ? String(obj[key]) : fallback);
 
-function extractLead(p = {}) {
-  // 1) Preferred: Structured Outputs (you created "lead")
-  //    Vapi may send as object or array. Handle both.
+function extractLead(payload = {}) {
   const so =
-    p.structured_outputs ||
-    p.structuredOutputs ||
-    p.outputs ||
-    p.output ||
+    payload.structured_outputs ||
+    payload.structuredOutputs ||
+    payload.outputs ||
+    payload.output ||
     null;
 
   let leadFromSO = null;
 
-  // If it's an object with "lead"
   if (so && typeof so === 'object' && !Array.isArray(so) && so.lead) {
     leadFromSO = so.lead;
   }
-
-  // If it's an array of structured outputs
   if (!leadFromSO && Array.isArray(so)) {
     for (const item of so) {
-      // some shapes: { name:"lead", data:{...} } OR { lead:{...} }
-      if (item && item.name === 'lead' && item.data) {
-        leadFromSO = item.data;
-        break;
-      }
-      if (item && item.lead) {
-        leadFromSO = item.lead;
-        break;
-      }
+      if (item && item.name === 'lead' && item.data) { leadFromSO = item.data; break; }
+      if (item && item.lead) { leadFromSO = item.lead; break; }
     }
   }
 
-  // 2) Older shapes (no structured outputs)
-  const caller = p.caller || {};
-  const quals = p.qualifications || {};
-  const summary = p.summary || p.final_summary || p.analysis?.summary || '';
+  const caller = payload.caller || {};
+  const quals = payload.qualifications || {};
+  const summary = payload.summary || payload.final_summary || payload.analysis?.summary || '';
 
-  // Map into a unified shape
   const mapped = {
-    name: '',
-    phone: '',
-    email: '',
-    role: '',
-    inquiry: '',
-    market: '',
-    dealSize: '',
-    urgency: '',
-    summary,
+    name: '', phone: '', email: '', role: '',
+    inquiry: '', market: '', dealSize: '', urgency: '', summary
   };
 
   if (leadFromSO) {
@@ -104,7 +84,6 @@ function extractLead(p = {}) {
     mapped.dealSize= pick(leadFromSO, 'dealSize') || pick(leadFromSO, 'deal_size');
     mapped.urgency = pick(leadFromSO, 'urgency');
   } else {
-    // fallback to older keys
     mapped.name    = pick(caller, 'name');
     mapped.phone   = pick(caller, 'phone');
     mapped.email   = pick(caller, 'email');
@@ -119,29 +98,34 @@ function extractLead(p = {}) {
 }
 
 function smallRaw(obj) {
-  // Only keep a tiny raw for debugging (no megabytes!)
   try {
-    const keep = {
-      lead: {
-        name: obj.name || '',
-        phone: obj.phone || '',
-        email: obj.email || '',
-        role: obj.role || '',
-        inquiry: obj.inquiry || '',
-        market: obj.market || '',
-        dealSize: obj.dealSize || '',
-        urgency: obj.urgency || '',
-      },
-    };
+    const keep = { lead: {
+      name: obj.name || '', phone: obj.phone || '', email: obj.email || '',
+      role: obj.role || '', inquiry: obj.inquiry || '', market: obj.market || '',
+      dealSize: obj.dealSize || '', urgency: obj.urgency || ''
+    }};
     return JSON.stringify(keep);
-  } catch {
-    return '{}';
-  }
+  } catch { return '{}'; }
 }
 // ----------------------------------------------------
 
+// ---------- Main Webhook ----------
 app.post('/vapi/webhook', async (req, res) => {
   try {
+    // 🧠 Debug logs — don’t remove yet!
+    console.log(
+      'INCOMING PAYLOAD content-type=%s length=%s',
+      req.headers['content-type'],
+      req.headers['content-length']
+    );
+    const preview = (() => {
+      try {
+        const src = req.body?.structured_outputs ?? req.body?.structuredOutputs ?? req.body;
+        return JSON.stringify(src, null, 2).slice(0, 2000);
+      } catch { return '<unserializable>'; }
+    })();
+    console.log('INCOMING BODY (trimmed):', preview);
+
     const p = req.body || {};
     const brokerage =
       p?.assistant?.metadata?.brokerageName ||
@@ -150,23 +134,21 @@ app.post('/vapi/webhook', async (req, res) => {
 
     const lead = extractLead(p);
 
-    // Build one clean row (no huge raw)
     const row = [
-      new Date().toISOString().replace('T', ' ').replace('Z', ' UTC'), // A: Timestamp
-      brokerage,                                                      // B: Brokerage
-      lead.name,                                                      // C: Name
-      lead.phone,                                                     // D: Phone
-      lead.email,                                                     // E: Email
-      lead.role,                                                      // F: Role
-      lead.inquiry,                                                   // G: Inquiry
-      lead.market,                                                    // H: Market
-      lead.dealSize,                                                  // I: Deal Size
-      lead.urgency,                                                   // J: Urgency
-      lead.summary || '',                                             // K: Summary
-      smallRaw(lead),                                                 // L: Raw (tiny)
+      new Date().toISOString().replace('T', ' ').replace('Z', ' UTC'),
+      brokerage,
+      lead.name,
+      lead.phone,
+      lead.email,
+      lead.role,
+      lead.inquiry,
+      lead.market,
+      lead.dealSize,
+      lead.urgency,
+      lead.summary || '',
+      smallRaw(lead),
     ];
 
-    // Append to A:L — your header row must have 12 columns
     await sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
       range: 'Sheet1!A:L',
@@ -180,9 +162,12 @@ app.post('/vapi/webhook', async (req, res) => {
     return res.status(200).json({ ok: false, error: String(err) });
   }
 });
+// ----------------------------------------------------
 
+// ---------- Health Routes ----------
 app.get('/', (_req, res) => res.send('Webhook running'));
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
+// ---------- Server ----------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('✅ Server listening on', PORT));
