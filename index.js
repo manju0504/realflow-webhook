@@ -1,4 +1,4 @@
-// index.js  (CommonJS)
+// index.js (CommonJS) — FINAL
 const express = require('express');
 const bodyParser = require('body-parser');
 const { google } = require('googleapis');
@@ -6,28 +6,30 @@ const { google } = require('googleapis');
 const app = express();
 app.use(bodyParser.json({ limit: '2mb' }));
 
-// ---------- ENV ----------
+// ===== ENV =====
 const SHEET_ID = process.env.SHEET_ID || process.env.SPREADSHEET_ID;
+const SHEET_RANGE = process.env.SHEET_RANGE || 'Sheet1!A:L'; // <-- change tab/range here if needed
+
 if (!SHEET_ID) {
   console.error('❌ Missing SHEET_ID / SPREADSHEET_ID env var');
   process.exit(1);
 }
 
-// Google auth: choose one of these approaches via envs
-// 1) GOOGLE_CREDENTIALS: full JSON (minified one-line)
-// 2) GOOGLE_APPLICATION_CREDENTIALS: absolute path to service-account.json (e.g., /etc/secrets/service-account.json)
+// ===== GOOGLE AUTH =====
+// Option A: GOOGLE_CREDENTIALS (full JSON as a single line)
+// Option B: GOOGLE_APPLICATION_CREDENTIALS (path to file, e.g., /etc/secrets/service-account.json)
 let auth;
 try {
   if (process.env.GOOGLE_CREDENTIALS) {
     const creds = JSON.parse(process.env.GOOGLE_CREDENTIALS);
     auth = new google.auth.GoogleAuth({
       credentials: creds,
-      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+      scopes: ['https://www.googleapis.com/auth/spreadsheets']
     });
   } else {
-    // This uses GOOGLE_APPLICATION_CREDENTIALS if set, or falls back to default ADC.
     auth = new google.auth.GoogleAuth({
-      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+      // uses GOOGLE_APPLICATION_CREDENTIALS if set, else default ADC
+      scopes: ['https://www.googleapis.com/auth/spreadsheets']
     });
   }
 } catch (e) {
@@ -37,28 +39,31 @@ try {
 
 const sheets = google.sheets({ version: 'v4', auth });
 
-// ---------- HELPERS ----------
+// ===== HELPERS =====
 const clean = (v) => (v == null ? '' : String(v).trim());
 const smallRaw = (obj) => {
   try {
     const j = JSON.stringify(obj || {});
-    return j.length > 500 ? j.slice(0, 497) + '...' : j;
+    return j.length > 1000 ? j.slice(0, 997) + '...' : j; // keep Raw compact
   } catch { return ''; }
 };
+
 const getCallId = (p) =>
   clean(
     p.call_id || p.callId || p.session_id || p.sessionId ||
-    p?.metadata?.call_id || p?.metadata?.session_id || ''
+    p?.metadata?.call_id || p?.metadata?.session_id || p?.assistant?.callId || ''
   );
 
-// Try to pull a “lead” object from Vapi structured outputs
+// Try to pull a “lead” object from typical structured output containers
 const tryExtractLeadSO = (p) => {
   if (p && typeof p.lead === 'object' && p.lead) return p.lead;
 
   const bags = [
     p?.structured_outputs,
     p?.assistant?.structured_outputs,
-    p?.data?.structured_outputs
+    p?.data?.structured_outputs,
+    p?.outputs,
+    p?.assistant?.outputs
   ].filter(Array.isArray);
 
   for (const arr of bags) {
@@ -74,7 +79,7 @@ const tryExtractLeadSO = (p) => {
   return null;
 };
 
-// Extract from caller/qualifications style (your current screenshot)
+// Extract from caller/qualifications style
 const tryExtractCQ = (p) => {
   const caller = p?.caller || {};
   const q = p?.qualifications || {};
@@ -86,7 +91,7 @@ const tryExtractCQ = (p) => {
     inquiry: q.inquiry,
     market: q.market,
     dealSize: q.deal_size || q.dealSize || q.budget,
-    urgency: q.urgency || q.timeline,
+    urgency: q.urgency || q.timeline
   };
 };
 
@@ -99,15 +104,16 @@ const normalize = (raw, summary) => ({
   market: clean(raw?.market),
   dealSize: clean(raw?.dealSize || raw?.deal_size || raw?.budget),
   urgency: clean(raw?.urgency || raw?.timeline),
-  summary: clean(summary || raw?.summary),
+  summary: clean(summary || raw?.summary)
 });
 
 const hasAnyLeadField = (lead) =>
-  ['name','phone','email','role','inquiry','market','dealSize','urgency']
+  ['name', 'phone', 'email', 'role', 'inquiry', 'market', 'dealSize', 'urgency']
     .some((k) => clean(lead[k]) !== '');
 
-// ---------- ROUTES ----------
+// ===== ROUTES =====
 app.get('/', (_req, res) => res.send('Realflow Vapi Webhook ✅'));
+app.get('/health', (_req, res) => res.json({ ok: true, sheetId: SHEET_ID, range: SHEET_RANGE }));
 
 const seenCallIds = new Set();
 
@@ -122,17 +128,17 @@ app.post('/vapi/webhook', async (req, res) => {
 
     const callId = getCallId(p);
 
-    // Prefer structured output “lead”, else fall back to caller/qualifications
+    // Prefer structured output “lead”, else merge with caller/qualifications
     const leadSO = tryExtractLeadSO(p);
     const cq = tryExtractCQ(p);
     const merged = normalize({ ...(leadSO || {}), ...cq }, p?.summary);
 
-    // If we don't have any meaningful fields yet, skip (Vapi may fire multiple events)
+    // No fields yet? This could be an early event — skip silently
     if (!hasAnyLeadField(merged)) {
       return res.status(200).json({ ok: true, skipped: 'no useful fields yet' });
     }
 
-    // Avoid double-writes per call
+    // Deduplicate per call/session
     if (callId) {
       if (seenCallIds.has(callId)) {
         return res.status(200).json({ ok: true, skipped: 'already wrote for this call' });
@@ -140,35 +146,36 @@ app.post('/vapi/webhook', async (req, res) => {
       seenCallIds.add(callId);
     }
 
+    // Build row (A:L)
     const row = [
       new Date().toISOString().replace('T', ' ').replace('Z', ' UTC'), // Timestamp
-      brokerage,
-      merged.name,
-      merged.phone,
-      merged.email,
-      merged.role,
-      merged.inquiry,
-      merged.market,
-      merged.dealSize,
-      merged.urgency,
-      merged.summary,
-      smallRaw({ lead: merged }), // Raw (compact)
+      brokerage,             // B: Brokerage
+      merged.name,           // C: Name
+      merged.phone,          // D: Phone
+      merged.email,          // E: Email
+      merged.role,           // F: Role
+      merged.inquiry,        // G: Inquiry
+      merged.market,         // H: Market
+      merged.dealSize,       // I: Deal Size
+      merged.urgency,        // J: Urgency
+      merged.summary,        // K: Summary
+      smallRaw({ lead: merged, callId }) // L: Raw (compact)
     ];
 
     await sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
-      range: 'Sheet1!A:L',
+      range: SHEET_RANGE,
       valueInputOption: 'USER_ENTERED',
-      requestBody: { values: [row] },
+      requestBody: { values: [row] }
     });
 
     return res.status(200).json({ ok: true, wrote: true, callId });
   } catch (e) {
     console.error('❌ Webhook error:', e);
-    // Return 200 so Vapi doesn’t retry aggressively
+    // still return 200 so upstream doesn't spam retries
     return res.status(200).json({ ok: false, error: String(e) });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Server listening on :${PORT}`));
+app.listen(PORT, () => console.log(`✅ Server listening on :${PORT} | range=${SHEET_RANGE}`));
