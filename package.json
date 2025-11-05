@@ -1,23 +1,15 @@
 {
-  "name": "realflow-webhook",
+  "name": "realflow-vapi-webhook",
   "version": "1.0.0",
-  "description": "Webhook server to log Realflow AI Agent calls into Google Sheets",
+  "description": "Webhook that receives Vapi call data and logs it to Google Sheets",
   "main": "index.js",
-  "type": "module",
+  "type": "commonjs",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node index.js"
+    "start": "node index.js"
   },
-  "keywords": ["realflow", "vapi", "google-sheets", "webhook", "express"],
-  "author": "Manju",
-  "license": "ISC",
   "dependencies": {
-    "body-parser": "^2.2.0",
-    "dotenv": "^16.4.5",
-    "express": "^5.1.0",
-    "googleapis": "^137.1.0"
-  },
-  "engines": {
-    "node": ">=18"
+    "body-parser": "^1.20.3",
+    "express": "^4.19.2",
+    "googleapis": "^131.0.0"
   }
 }
