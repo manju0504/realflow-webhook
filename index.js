@@ -1,4 +1,4 @@
-// ---------- Imports & App ----------
+// index.js  (CommonJS)
 const express = require('express');
 const bodyParser = require('body-parser');
 const { google } = require('googleapis');
@@ -7,14 +7,17 @@ const app = express();
 app.use(bodyParser.json({ limit: '2mb' }));
 
 // ---------- Env ----------
-const PORT = process.env.PORT || 3000;
-const SHEET_ID = process.env.SHEET_ID; // required
+// accept either SHEET_ID or SPREADSHEET_ID
+const SHEET_ID = process.env.SHEET_ID || process.env.SPREADSHEET_ID;
 if (!SHEET_ID) {
-  console.error('❌ Missing SHEET_ID env');
+  console.error('❌ Missing SHEET_ID / SPREADSHEET_ID env var');
   process.exit(1);
 }
 
-// Auth: either GOOGLE_APPLICATION_CREDENTIALS (file path) OR GOOGLE_CREDENTIALS (inline JSON)
+// Auth options (any one):
+// 1) GOOGLE_CREDENTIALS = full JSON (one-line)
+// 2) GOOGLE_APPLICATION_CREDENTIALS = /path/to/service-account.json
+// 3) Default ADC if running somewhere with creds
 let auth;
 try {
   if (process.env.GOOGLE_CREDENTIALS) {
@@ -23,7 +26,14 @@ try {
       credentials: creds,
       scopes: ['https://www.googleapis.com/auth/spreadsheets'],
     });
+  } else if (process.env.GCP_SERVICE_ACCOUNT_JSON) {
+    const creds = JSON.parse(process.env.GCP_SERVICE_ACCOUNT_JSON);
+    auth = new google.auth.GoogleAuth({
+      credentials: creds,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
   } else {
+    // If using a secret file on Render, set GOOGLE_APPLICATION_CREDENTIALS=/etc/secrets/service-account.json
     auth = new google.auth.GoogleAuth({
       scopes: ['https://www.googleapis.com/auth/spreadsheets'],
     });
@@ -35,110 +45,101 @@ try {
 
 const sheets = google.sheets({ version: 'v4', auth });
 
-// De-dupe memory (per-process). Good enough for Render.
-const seenCallIds = new Set();
-
 // ---------- Helpers ----------
 const clean = (v) => (v == null ? '' : String(v).trim());
-
-const smallRaw = (lead) => {
+const smallRaw = (obj) => {
   try {
-    const j = JSON.stringify(lead || {});
+    const j = JSON.stringify(obj || {});
     return j.length > 500 ? j.slice(0, 497) + '...' : j;
-  } catch {
-    return '';
-  }
+  } catch { return ''; }
 };
-
-// Pull a likely call/session identifier so we only write once per call
 const getCallId = (p) =>
   clean(
-    p.call_id ||
-    p.callId ||
-    p.session_id ||
-    p.sessionId ||
-    (p.metadata && (p.metadata.call_id || p.metadata.session_id)) ||
-    ''
+    p.call_id || p.callId || p.session_id || p.sessionId ||
+    p?.metadata?.call_id || p?.metadata?.session_id || ''
   );
 
-// Find any “lead” structured output regardless of where Vapi put it
-const extractLead = (p) => {
-  // 1) Direct `lead` object (some screens send it this way)
-  if (p && typeof p.lead === 'object' && p.lead) {
-    return normalizeLead(p.lead, p.summary);
-  }
+// Extract “lead” if present (Vapi structured output)
+const tryExtractLeadSO = (p) => {
+  if (p && typeof p.lead === 'object' && p.lead) return p.lead;
 
-  // 2) Top-level structured outputs
-  const tryCollections = [];
-  if (Array.isArray(p?.structured_outputs)) tryCollections.push(p.structured_outputs);
-  if (Array.isArray(p?.assistant?.structured_outputs)) tryCollections.push(p.assistant.structured_outputs);
-  if (Array.isArray(p?.data?.structured_outputs)) tryCollections.push(p.data.structured_outputs);
+  const bags = [
+    p?.structured_outputs,
+    p?.assistant?.structured_outputs,
+    p?.data?.structured_outputs
+  ].filter(Array.isArray);
 
-  for (const arr of tryCollections) {
+  for (const arr of bags) {
     const hit =
       arr.find((x) => (x?.name || '').toLowerCase() === 'lead') ||
       arr.find((x) => x?.type === 'lead' || x?.id === 'lead') ||
-      arr.find((x) => x && typeof x === 'object' && (
-        x.lead || x.data?.lead || x.data
-      ));
+      arr.find((x) => x?.lead) ||
+      arr.find((x) => x?.data?.lead) ||
+      arr.find((x) => x?.data);
 
-    if (hit) {
-      // Common shapes:
-      // { name:'lead', data:{...} }
-      // { lead:{...} }
-      // {...fields...}
-      const payload = hit.lead || hit.data?.lead || hit.data || hit;
-      return normalizeLead(payload, p.summary);
-    }
+    if (hit) return hit.lead || hit.data?.lead || hit.data || hit;
   }
-
-  // Nothing found → return empty
-  return normalizeLead({}, p.summary);
+  return null;
 };
 
-const normalizeLead = (raw, summary) => {
-  // Map & trim everything we care about
-  const out = {
-    name: clean(raw.name),
-    phone: clean(raw.phone),
-    email: clean(raw.email),
-    role: clean(raw.role),
-    inquiry: clean(raw.inquiry),
-    market: clean(raw.market),
-    dealSize: clean(raw.dealSize || raw.deal_size || raw.budget),
-    urgency: clean(raw.urgency || raw.timeline),
-    summary: clean(summary || raw.summary),
+// Extract from caller/qualifications style
+const tryExtractCQ = (p) => {
+  const caller = p?.caller || {};
+  const q = p?.qualifications || {};
+  return {
+    name: caller.name,
+    phone: caller.phone || caller.number,
+    email: caller.email,
+    role: q.role,
+    inquiry: q.inquiry,
+    market: q.market,
+    dealSize: q.deal_size || q.dealSize || q.budget,
+    urgency: q.urgency || q.timeline,
   };
-  return out;
 };
+
+const normalize = (raw, summary) => ({
+  name: clean(raw?.name),
+  phone: clean(raw?.phone),
+  email: clean(raw?.email),
+  role: clean(raw?.role),
+  inquiry: clean(raw?.inquiry),
+  market: clean(raw?.market),
+  dealSize: clean(raw?.dealSize || raw?.deal_size || raw?.budget),
+  urgency: clean(raw?.urgency || raw?.timeline),
+  summary: clean(summary || raw?.summary),
+});
 
 const hasAnyLeadField = (lead) =>
-  Object.entries(lead).some(([k, v]) => k !== 'summary' && clean(v) !== '');
+  ['name','phone','email','role','inquiry','market','dealSize','urgency']
+    .some((k) => clean(lead[k]) !== '');
 
 // ---------- Routes ----------
-app.get('/', (req, res) => {
-  res.send('OK');
-});
+app.get('/', (_req, res) => res.send('OK'));
+
+const seenCallIds = new Set();
 
 app.post('/vapi/webhook', async (req, res) => {
   try {
     const p = req.body || {};
 
-    // Pull brokerage label (you set this in Assistant metadata)
     const brokerage =
       clean(p?.assistant?.metadata?.brokerageName) ||
       clean(p?.assistant?.brokerageName) ||
       'Ariel Property Advisors';
 
     const callId = getCallId(p);
-    const lead = extractLead(p);
 
-    // Only write when a real structured output is present
-    if (!hasAnyLeadField(lead)) {
-      return res.status(200).json({ ok: true, skipped: 'no structured output yet' });
+    // prefer structured output 'lead', else fall back to caller/qualifications
+    const leadSO = tryExtractLeadSO(p);
+    const cq = tryExtractCQ(p);
+    const merged = normalize({ ...(leadSO || {}), ...cq }, p?.summary);
+
+    if (!hasAnyLeadField(merged)) {
+      // store at least a lightweight raw for debugging once per call
+      return res.status(200).json({ ok: true, skipped: 'no useful fields yet' });
     }
 
-    // De-dupe: write once per call/session
     if (callId) {
       if (seenCallIds.has(callId)) {
         return res.status(200).json({ ok: true, skipped: 'already wrote for this call' });
@@ -146,20 +147,19 @@ app.post('/vapi/webhook', async (req, res) => {
       seenCallIds.add(callId);
     }
 
-    // Row A–L
     const row = [
-      new Date().toISOString().replace('T', ' ').replace('Z', ' UTC'), // A Timestamp
-      brokerage,                         // B Brokerage
-      lead.name,                         // C
-      lead.phone,                        // D
-      lead.email,                        // E
-      lead.role,                         // F
-      lead.inquiry,                      // G
-      lead.market,                       // H
-      lead.dealSize,                     // I
-      lead.urgency,                      // J
-      lead.summary || '',                // K Summary
-      smallRaw(lead),                    // L Raw (tiny JSON)
+      new Date().toISOString().replace('T', ' ').replace('Z', ' UTC'), // Timestamp
+      brokerage,
+      merged.name,
+      merged.phone,
+      merged.email,
+      merged.role,
+      merged.inquiry,
+      merged.market,
+      merged.dealSize,
+      merged.urgency,
+      merged.summary,
+      smallRaw({ lead: merged }), // Raw
     ];
 
     await sheets.spreadsheets.values.append({
@@ -170,14 +170,12 @@ app.post('/vapi/webhook', async (req, res) => {
     });
 
     return res.status(200).json({ ok: true, wrote: true, callId });
-  } catch (err) {
-    console.error('❌ Webhook error:', err);
-    // Always 200 so Vapi doesn’t retry, but include the error for visibility
-    return res.status(200).json({ ok: false, error: String(err) });
+  } catch (e) {
+    console.error('❌ Webhook error:', e);
+    // keep 200 to avoid retries
+    return res.status(200).json({ ok: false, error: String(e) });
   }
 });
 
-// ---------- Start ----------
-app.listen(PORT, () => {
-  console.log(`✅ Server listening on ${PORT}`);
-});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`✅ Server on :${PORT}`));
